@@ -45,6 +45,7 @@ storage = Storage(STORAGE_DIR)
 engine = SharpEngine(device=DEVICE, checkpoint_path=Path(CHECKPOINT) if CHECKPOINT else None)
 
 _ready = threading.Event()        # set once model is loaded
+_warmup_started = threading.Event()  # set once the load thread has been kicked off
 _processing = threading.Event()   # set while a prediction is running
 
 # Lets the mobile app tell the viewer "show this specific memory now" without
@@ -187,6 +188,17 @@ def _warmup() -> None:
         LOGGER.exception("Failed to load SHARP model during warmup")
 
 
+def _ensure_warmup_started() -> None:
+    """Kick off the (slow) SHARP load on first use instead of at server
+    startup, so `npm run dev` comes up instantly and idle dev sessions don't
+    pay the checkpoint load / VRAM cost."""
+    if _ready.is_set() or _warmup_started.is_set():
+        return
+    _warmup_started.set()
+    LOGGER.info("Warming up SHARP model in the background (device=%s)...", engine.device)
+    threading.Thread(target=_warmup, name="sharp-warmup", daemon=True).start()
+
+
 def _warm_proxies() -> None:
     """Pre-build the tiny viewer proxy blobs for every existing scene so the
     first visitor's viewer boots instantly instead of triggering 30-odd
@@ -210,8 +222,6 @@ def _warm_proxies() -> None:
 @app.on_event("startup")
 def on_startup() -> None:
     LOGGER.info("Storage at %s", STORAGE_DIR)
-    LOGGER.info("Warming up SHARP model in the background (device=%s)...", engine.device)
-    threading.Thread(target=_warmup, name="sharp-warmup", daemon=True).start()
     threading.Thread(target=_warm_proxies, name="proxy-warmup", daemon=True).start()
 
 
@@ -465,6 +475,7 @@ def predict(
         )
 
     # Block until the model is loaded (first run may download the checkpoint).
+    _ensure_warmup_started()
     if not _ready.wait(timeout=WARMUP_TIMEOUT):
         raise HTTPException(status_code=503, detail="Model is still warming up. Try again shortly.")
 
