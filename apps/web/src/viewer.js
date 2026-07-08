@@ -342,14 +342,114 @@ async function mapWithConcurrency(items, limit, fn) {
 // full quality only ever loads for whichever ONE scene the visitor is
 // currently near, everything else stays a lightweight point cloud.
 const POINT_CLOUD_MAX_POINTS = 12_000;
-// World-space point size (sizeAttenuation is ON below) so points shrink with
-// distance — near memories read as a full cloud, far ones stay small dots
-// instead of a same-size screen-space mess piled over everything.
+// Base world-space point size at "1 unit from camera" — see uPixelScale below,
+// which turns this into an actual on-screen pixel size every frame.
 const POINT_SIZE = 0.35;
+// Distance (world units) from the camera within which a point is fully
+// visible/at max size, and beyond which it fades all the way to invisible.
+// Tunable — these are a first pass; adjust to taste once you can see it live.
+const POINT_FADE_NEAR = 8;
+const POINT_FADE_FAR  = 140;
+// On-screen size clamp in pixels: MAX makes close-up points read as "quite
+// large" instead of a fine mist; MIN keeps far-but-still-visible points from
+// shimmering at sub-pixel size. Keep MAX modest — each point is ONE flat,
+// unblended splat colour, so blowing it up too far turns a soft-looking
+// cloud into a mosaic of harsh, oversized, single-colour tiles.
+const POINT_MAX_PIXEL_SIZE = 14;
+const POINT_MIN_PIXEL_SIZE = 1.5;
 // Proxies are now tiny pre-decimated blobs (~180 KB) served by
 // /api/scene-proxy, not the full ~64 MB PLY — so we can fetch many at once.
 const PROXY_BUILD_CONCURRENCY = 8;
 const pointCloudProxies = new Map(); // scene id → THREE.Points
+
+// ── Point-cloud shader ───────────────────────────────────────────────────
+// A custom shader instead of THREE.PointsMaterial for two reasons at once:
+//
+//   1. DISTANCE-BASED SIZE/FADE. Close points should read as "quite large",
+//      far ones should fade out entirely — plain sizeAttenuation only
+//      shrinks them, it doesn't clamp a max size or cut off a min.
+//
+//   2. CORRECT OCCLUSION AGAINST SPLATS. Spark's splats explicitly depth-test
+//      against opaque scene geometry (see SparkRenderer's depthTest option),
+//      so as long as these points stay OPAQUE (draw fully or not at all —
+//      never alpha-blended) they occlude/get occluded by splats correctly.
+//      The fade above is done with a dithered (screen-door) discard instead
+//      of real alpha blending for exactly this reason: real transparency
+//      would move points into THREE's transparent render queue, sorted by
+//      object rather than per-pixel against the splats — which is what was
+//      letting a proxy that should be hidden behind a splat show through.
+const POINT_VERTEX_SHADER = /* glsl */ `
+  attribute vec3 color;
+  varying vec3 vColor;
+  varying float vVisible;
+
+  uniform float uPixelScale;   // world units -> pixels at 1 unit of distance
+  uniform float uMaxPixelSize;
+  uniform float uMinPixelSize;
+  uniform float uFadeNear;
+  uniform float uFadeFar;
+
+  void main() {
+    vColor = color;
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    float dist = -mvPosition.z;
+
+    vVisible = 1.0 - smoothstep(uFadeNear, uFadeFar, dist);
+    gl_PointSize = clamp(uPixelScale / max(dist, 0.001), uMinPixelSize, uMaxPixelSize);
+    gl_Position = projectionMatrix * mvPosition;
+  }
+`;
+
+const POINT_FRAGMENT_SHADER = /* glsl */ `
+  varying vec3 vColor;
+  varying float vVisible;
+
+  float ditherThreshold(vec2 co) {
+    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+  }
+
+  // Custom ShaderMaterial gets none of THREE's automatic linear->sRGB output
+  // conversion that built-in materials apply — vColor arrives here already
+  // decoded to linear (see srgbToLinear() on the JS side), so this is the
+  // matching re-encode for display. Without it, colour comes out too dark in
+  // the midtones; getting the decode/encode direction backwards instead
+  // (encoding twice) is what produces oversaturated, blown-out colour.
+  vec3 linearToSRGB(vec3 c) {
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(lo, hi, step(vec3(0.0031308), c));
+  }
+
+  void main() {
+    // Soft round sprite instead of a hard-edged square — feathered edge
+    // reads as a natural blob and blends into neighbouring points instead
+    // of tiling into an obvious flat-coloured mosaic.
+    float d = length(gl_PointCoord - 0.5);
+    float shape = 1.0 - smoothstep(0.3, 0.5, d);
+    if (shape <= 0.0 || vVisible * shape < ditherThreshold(gl_FragCoord.xy)) discard;
+    gl_FragColor = vec4(linearToSRGB(vColor), 1.0);
+  }
+`;
+
+// Shared by every point cloud's material, so updating one entry (on resize)
+// updates the on-screen size for every proxy at once.
+const pointUniforms = {
+  uPixelScale:   { value: 1 },
+  uMaxPixelSize: { value: POINT_MAX_PIXEL_SIZE },
+  uMinPixelSize: { value: POINT_MIN_PIXEL_SIZE },
+  uFadeNear:     { value: POINT_FADE_NEAR },
+  uFadeFar:      { value: POINT_FADE_FAR },
+};
+
+// uPixelScale depends on the camera's vertical FOV and the canvas height —
+// the same relationship THREE's own sizeAttenuation uses internally. Call
+// once the camera exists and again on every resize.
+function updatePointPixelScale() {
+  const cam = viewer?.camera;
+  if (!cam) return;
+  const fovRad = cam.fov * (Math.PI / 180);
+  pointUniforms.uPixelScale.value = POINT_SIZE * (window.innerHeight / (2 * Math.tan(fovRad / 2)));
+}
 
 // Fetches the tiny pre-decimated proxy blob (see apps/api/proxy.py) and
 // unpacks it into plain Float32 position/colour arrays. This is ~180 KB over
@@ -366,8 +466,19 @@ async function fetchProxyPoints(sceneId) {
   const positions = new Float32Array(buf, 8, count * 3);        // 8 is 4-byte aligned
   const colU8     = new Uint8Array(buf, 8 + count * 12, count * 3);
   const colors    = new Float32Array(count * 3);
-  for (let i = 0; i < colors.length; i++) colors[i] = colU8[i] / 255;
+  // These bytes are ordinary sRGB-encoded colour (same convention as any
+  // photo pixel), but our point-cloud shader is a custom ShaderMaterial —
+  // unlike built-in materials, THREE doesn't auto-convert vertex colours for
+  // those, and it expects them in linear space. Decode sRGB->linear here so
+  // the shader's own linear->sRGB encode (see POINT_FRAGMENT_SHADER) round-
+  // trips back to the original colour instead of gamma-compounding it into
+  // an oversaturated mess.
+  for (let i = 0; i < colors.length; i++) colors[i] = srgbToLinear(colU8[i] / 255);
   return { positions, colors, count };
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
 // Measure a scene's on-plane footprint from the proxy points (5th–95th
@@ -401,10 +512,18 @@ async function addPointCloudProxy(scene, worldPos) {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(data.positions, 3));
   geometry.setAttribute("color", new THREE.BufferAttribute(data.colors, 3));
-  // sizeAttenuation:true → POINT_SIZE is world units, so points get smaller
-  // with distance (perspective), which keeps a field of memories readable
-  // instead of a flat mess of equal-size dots.
-  const material = new THREE.PointsMaterial({ size: POINT_SIZE, vertexColors: true, sizeAttenuation: true });
+  // See the "Point-cloud shader" block above: opaque + dithered fade instead
+  // of THREE.PointsMaterial, so size/visibility scale with distance from the
+  // camera (large close up, invisible far away) without breaking occlusion
+  // against the gaussian splats.
+  const material = new THREE.ShaderMaterial({
+    uniforms: pointUniforms,
+    vertexShader: POINT_VERTEX_SHADER,
+    fragmentShader: POINT_FRAGMENT_SHADER,
+    transparent: false,
+    depthTest: true,
+    depthWrite: true,
+  });
   const points = new THREE.Points(geometry, material);
   points.position.set(worldPos[0], worldPos[1], worldPos[2]);
   viewer.threeScene.add(points);
@@ -989,10 +1108,12 @@ function ensureViewer() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    updatePointPixelScale();
   });
 
   viewer = { camera, threeScene, renderer, spark };
   applyFPSCamera();
+  updatePointPixelScale();
   console.log("[viewer] Spark renderer ready");
 }
 
