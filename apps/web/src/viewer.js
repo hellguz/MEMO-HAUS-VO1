@@ -373,11 +373,11 @@ async function mapWithConcurrency(items, limit, fn) {
 // currently near, everything else stays a lightweight point cloud.
 const POINT_CLOUD_MAX_POINTS = 12_000;
 // Size knob, fed into uPixelScale below. Bigger = larger points overall.
-const POINT_SIZE = 500;
+const POINT_SIZE = 1;
 // On-screen size clamp in pixels. MAX caps close-up points so they don't
 // become huge tiles. MIN is the floor; set it to 0 so distant points shrink
 // all the way to nothing (a sub-pixel point is snapped to 0 = not drawn).
-const POINT_MAX_PIXEL_SIZE = 25;
+const POINT_MAX_PIXEL_SIZE = 20;
 const POINT_MIN_PIXEL_SIZE = 0;
 // Proxies are tiny decimated blobs (~180 KB) served by /api/scene-proxy, not
 // the full ~64 MB PLY — so we can fetch many at once.
@@ -385,11 +385,11 @@ const PROXY_BUILD_CONCURRENCY = 8;
 const pointCloudProxies = new Map(); // scene id → THREE.Points
 
 // ── Point-cloud shader ───────────────────────────────────────────────────
-// Custom shader (not THREE.PointsMaterial) so point size falls off with the
-// SQUARE of distance — near points read large, far ones shrink fast and
-// vanish entirely (no fade, no dithering: a point smaller than a pixel is
-// snapped to size 0 and simply isn't drawn). Points stay fully OPAQUE so they
-// depth-test correctly against Spark's splats.
+// Custom shader (not THREE.PointsMaterial) so point size attenuates with
+// distance (uPixelScale / dist) — near points read large, far ones small.
+// No fade, no dithering: a point that shrinks below a pixel is snapped to
+// size 0 and simply isn't drawn. Points stay fully OPAQUE so they depth-test
+// correctly against Spark's splats.
 const POINT_VERTEX_SHADER = /* glsl */ `
   attribute vec3 color;
   varying vec3 vColor;
@@ -403,11 +403,10 @@ const POINT_VERTEX_SHADER = /* glsl */ `
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     float dist = max(-mvPosition.z, 0.001);
 
-    // Inverse-SQUARE distance falloff (uPixelScale / dist^2): apparent size
-    // drops with the square of distance, so far points collapse quickly.
-    float size = clamp(uPixelScale / (dist * dist), uMinPixelSize, uMaxPixelSize);
-    // Anything under a pixel would only ever be flickery noise — snap it to 0
-    // so distant points are cleanly invisible rather than a speckled haze.
+    // Perspective size attenuation: apparent size ∝ 1 / distance.
+    float size = clamp(uPixelScale / dist, uMinPixelSize, uMaxPixelSize);
+    // A sub-pixel point would only ever be flickery noise — snap it to 0 so
+    // it disappears cleanly instead of leaving a speckle.
     gl_PointSize = size < 1.0 ? 0.0 : size;
     gl_Position = projectionMatrix * mvPosition;
   }
