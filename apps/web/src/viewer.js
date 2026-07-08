@@ -25,6 +25,10 @@ const overlayStoryTextEl = document.getElementById("overlay-story-text");
 // sceneAudioEl kept in DOM but audio is now routed through Web Audio for spatialization
 const sceneAudioEl       = document.getElementById("scene-audio");
 const cursorReticleEl    = document.getElementById("cursor-reticle");
+const boxesBtn       = document.getElementById("btn-boxes");
+const musicBtn       = document.getElementById("btn-music");
+const fullscreenBtn  = document.getElementById("btn-fullscreen");
+const renderModeBtn  = document.getElementById("btn-render-mode");
 
 // ── Debug helpers ─────────────────────────────────────────────────────────
 // ?limit=N in the URL loads only the first N memories into the world instead
@@ -53,16 +57,29 @@ const _audioBufferCache = new Map(); // url → Promise<AudioBuffer>
 // sceneId → { source, panner, gainNode, worldPos }
 const _activeSources = new Map();
 
+// Music on/off button (bottom-right) — on by default. Muting suspends the
+// shared AudioContext rather than stopping sources, so un-muting resumes
+// exactly where it left off instead of restarting every track.
+let audioMuted = false;
+
+function setMusicEnabled(enabled) {
+  audioMuted = !enabled;
+  if (!_audioCtx) return;
+  if (audioMuted) _audioCtx.suspend().catch(() => {});
+  else _audioCtx.resume().catch(() => {});
+}
+
 function getAudioCtx() {
   if (!_audioCtx) {
     _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioMuted) _audioCtx.suspend().catch(() => {});
   }
   return _audioCtx;
 }
 
 // Resume the context on any user gesture so audio can start on mobile.
 document.addEventListener("pointerdown", () => {
-  if (_audioCtx && _audioCtx.state === "suspended") _audioCtx.resume().catch(() => {});
+  if (!audioMuted && _audioCtx && _audioCtx.state === "suspended") _audioCtx.resume().catch(() => {});
 }, { passive: true });
 
 function _fetchAudioBuffer(url) {
@@ -131,6 +148,7 @@ const AUDIO_SMOOTH   = 0.18; // gentle ramp so cross-fades feel seamless
 function updateSpatialAudio() {
   const cam = viewer?.camera;
   if (!_audioCtx || !cam) return;
+  if (audioMuted) return; // leave it suspended — don't fight the mute button
   if (_audioCtx.state === "suspended") { _audioCtx.resume().catch(() => {}); return; }
 
   const { x, y, z } = cam.position;
@@ -296,6 +314,7 @@ function moveSceneTo(id, p) {
     if (rp !== -1) splatRecency.splice(rp, 1);
     enqueueSplatOp(`move-reload ${id}`, () => splatUnload(id));
   }
+  refreshBoundaryBoxes();
 }
 
 // Poll the server for map edits and apply any moved memory in real time — this
@@ -550,6 +569,62 @@ function clearPointCloudProxies() {
   pointCloudProxies.clear();
 }
 
+// ── Debug: memory boundary boxes ─────────────────────────────────────────
+// Green wireframe box per scene, sized from the same sceneExtents used to
+// lay the world out and frame the overview camera — this is the actual
+// bounding volume the app already computes, just made visible on demand.
+let showBoundaryBoxes = false;
+const boundaryBoxHelpers = new Map(); // scene id → THREE.Box3Helper
+
+function refreshBoundaryBoxes() {
+  if (!showBoundaryBoxes || !viewer) return;
+  const liveIds = new Set();
+  for (const s of worldScenes) {
+    const pos = worldPositions.get(s.id);
+    if (!pos) continue;
+    liveIds.add(s.id);
+    const ext = sceneExtents.get(s.id);
+    const half = ext
+      ? [ext.xSpan / 2, ext.ySpan / 2, ext.zSpan / 2]
+      : [WORLD_SPACING / 2, WORLD_SPACING / 2, WORLD_SPACING / 2];
+    const box = new THREE.Box3(
+      new THREE.Vector3(pos[0] - half[0], pos[1] - half[1], pos[2] - half[2]),
+      new THREE.Vector3(pos[0] + half[0], pos[1] + half[1], pos[2] + half[2]),
+    );
+    const existing = boundaryBoxHelpers.get(s.id);
+    if (existing) {
+      existing.box.copy(box);
+    } else {
+      const helper = new THREE.Box3Helper(box, new THREE.Color(0x00ff00));
+      boundaryBoxHelpers.set(s.id, helper);
+      viewer.threeScene.add(helper);
+    }
+  }
+  // Drop helpers for scenes that dropped out of the current world set.
+  for (const [id, helper] of boundaryBoxHelpers) {
+    if (liveIds.has(id)) continue;
+    viewer.threeScene.remove(helper);
+    helper.geometry.dispose();
+    helper.material.dispose();
+    boundaryBoxHelpers.delete(id);
+  }
+}
+
+function clearBoundaryBoxes() {
+  for (const helper of boundaryBoxHelpers.values()) {
+    viewer?.threeScene?.remove(helper);
+    helper.geometry.dispose();
+    helper.material.dispose();
+  }
+  boundaryBoxHelpers.clear();
+}
+
+function setBoundaryBoxesVisible(enabled) {
+  showBoundaryBoxes = enabled;
+  if (enabled) refreshBoundaryBoxes();
+  else clearBoundaryBoxes();
+}
+
 // ── Full-resolution splats: keep-one-loaded + preload-ahead ──────────────
 // Two ideas make the point-cloud → splat swap feel instant instead of a 10 s
 // freeze on arrival:
@@ -571,14 +646,14 @@ function clearPointCloudProxies() {
 // full-res splat (see /api/scene-splat). 1.0 = original ~1.17M-gaussian scene;
 // lower = lighter + proportionally faster to swap in, at some loss of
 // density. This is the main quality/speed dial.
-const FULLRES_KEEP        = 0.5;
+const FULLRES_KEEP        = 1;
 const FULLRES_ENTER_DIST  = 7;    // this scene becomes the one we're "in"
 const FULLRES_PRELOAD_DIST = 26;  // begin background-loading a scene from this far
 // How many full-res splats may stay resident at once. Rather than unloading a
 // scene the moment you leave it, we keep the N most-recently-visited loaded, so
 // stepping back to a memory you just saw is instant (no reload). Higher = more
 // instant revisits but more GPU memory. Lower it if the GPU is tight.
-const MAX_LOADED_SPLATS   = 4;
+const MAX_LOADED_SPLATS   = 1;
 // Spark loads each scene as its own independent SplatMesh (no shared add/
 // remove queue to race, unlike the old library), so there's no forced settle
 // gap between ops anymore. The queue below is kept only to stop the
@@ -685,6 +760,26 @@ function resetSplatState() {
   _prefetchedPly.clear();
 }
 
+// Debug render-mode toggle: "point cloud" forces every scene down to its
+// proxy and blocks reconcileSplats() from loading anything (see the guard
+// there) — "splat" (the normal default) resumes the usual proximity LOD.
+let forcePointCloudOnly = false;
+
+function setPointCloudOnly(enabled) {
+  forcePointCloudOnly = enabled;
+  if (!enabled) return; // normal LOD just picks back up next frame
+  splatBusy = true;
+  (async () => {
+    // Not routed through enqueueSplatOp — this needs to drain everything in
+    // one go, not interleave with the reconciler (already blocked above).
+    for (const id of [...loadedSplatIds]) {
+      await splatUnload(id); // re-shows each scene's proxy as it unloads
+    }
+    primaryId = wantPrimaryId = preloadId = focusRequestId = null;
+    splatBusy = false;
+  })();
+}
+
 // Drives the loaded set toward what we want (the primary we're aiming at plus
 // the nearest neighbour we're preloading), while keeping up to
 // MAX_LOADED_SPLATS resident as an LRU cache so recently-visited memories stay
@@ -692,7 +787,7 @@ function resetSplatState() {
 // settled. Loading the wanted primary is prioritised, and the outgoing primary
 // is kept until the new one is fully in, so there's never an empty frame.
 function reconcileSplats() {
-  if (!viewer || splatBusy) return;
+  if (!viewer || splatBusy || forcePointCloudOnly) return;
 
   // Must-haves: never evict these, always load them.
   const pinned = new Set();
@@ -1504,6 +1599,7 @@ async function buildWorldMode(sceneIds) {
       console.error("Failed clearing world:", err);
     }
     clearPointCloudProxies();
+    clearBoundaryBoxes();
     resetSplatState();
     ensureViewer();
     stopAllAudio();
@@ -1565,6 +1661,7 @@ async function buildWorldMode(sceneIds) {
       const pos = worldPositions.get(s.id);
       if (p && pos) p.position.set(pos[0], pos[1], pos[2]);
     }
+    refreshBoundaryBoxes();
     if (viewer?.camera && DEBUG_LIMIT == null) {
       const { x, y, z, yaw, pitch } = worldOverviewPos();
       viewer.camera.position.set(x, y, z);
@@ -1729,6 +1826,7 @@ async function poll() {
               console.error("[viewer] poll: failed adding proxy for new memory:", s.id, err);
             }
           });
+          refreshBoundaryBoxes();
           console.log(`[viewer] poll: added ${fresh.length} scene(s) to world in ${(performance.now() - t0).toFixed(0)}ms`);
         }
       }
@@ -1871,6 +1969,37 @@ document.addEventListener("keydown", enterFullscreen, { once: true });
 // Manual toggle for testing/operator use
 document.addEventListener("keydown", e => {
   if (e.code === "KeyF") toggleFullscreen();
+});
+
+// ── Debug / utility control buttons (bottom-right) ────────────────────────
+
+boxesBtn?.addEventListener("click", () => {
+  const next = !showBoundaryBoxes;
+  setBoundaryBoxesVisible(next);
+  boxesBtn.classList.toggle("active", next);
+  boxesBtn.setAttribute("aria-pressed", String(next));
+});
+
+musicBtn?.addEventListener("click", () => {
+  const enabling = audioMuted; // currently muted → this click turns it on
+  setMusicEnabled(enabling);
+  musicBtn.classList.toggle("active", enabling);
+  musicBtn.setAttribute("aria-pressed", String(enabling));
+});
+
+fullscreenBtn?.addEventListener("click", () => toggleFullscreen());
+document.addEventListener("fullscreenchange", () => {
+  const fs = isFullscreen();
+  fullscreenBtn?.classList.toggle("active", fs);
+  fullscreenBtn?.setAttribute("aria-pressed", String(fs));
+});
+
+renderModeBtn?.addEventListener("click", () => {
+  const next = !forcePointCloudOnly;
+  setPointCloudOnly(next);
+  renderModeBtn.textContent = next ? "POINTS" : "SPLAT";
+  renderModeBtn.classList.toggle("active", next);
+  renderModeBtn.setAttribute("aria-pressed", String(next));
 });
 
 // ── Keyboard fly navigation ───────────────────────────────────────────────
