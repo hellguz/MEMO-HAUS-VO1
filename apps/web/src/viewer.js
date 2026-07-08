@@ -693,9 +693,28 @@ async function loadSplatMesh(url, position) {
   const fileBytes = await res.arrayBuffer();
   const mesh = new SplatMesh({ fileBytes, fileType: SplatFileType.PLY });
   mesh.position.set(position[0], position[1], position[2]);
+  mesh.opacity = 0; // start invisible; caller fades it in once ready
   viewer.threeScene.add(mesh);
   await mesh.initialized;
   return mesh;
+}
+
+// Spark has no built-in load reveal, but SplatMesh exposes a global `opacity`,
+// so a simple ease-in tween gives a clean "materialise" as the splat appears.
+// (A directional wipe would need Spark's dyno shader modifiers — much heavier.)
+// onDone fires once the fade completes — used to hide the point-cloud proxy
+// only AFTER the splat has fully faded in over it (a cross-fade reveal).
+const SPLAT_FADE_MS = 900;
+function fadeInSplat(mesh, onDone) {
+  const t0 = performance.now();
+  function step(now) {
+    if (!mesh.parent) return; // unloaded mid-fade — stop
+    const t = Math.min((now - t0) / SPLAT_FADE_MS, 1);
+    mesh.opacity = t * t * (3 - 2 * t); // smoothstep ease
+    if (t < 1) requestAnimationFrame(step);
+    else if (onDone) onDone();
+  }
+  requestAnimationFrame(step);
 }
 
 // ── Serialised splat load/unload ─────────────────────────────────────────
@@ -726,7 +745,9 @@ async function splatLoad(sceneId) {
   placeSceneObject(mesh, sceneId, pos);
   splatMeshes.set(sceneId, mesh);
   loadedSplatIds.push(sceneId);
-  hidePointCloudProxy(sceneId);
+  // Fade the splat in over the still-visible point cloud, then hide the proxy
+  // once it's fully in — a cross-fade reveal rather than a hard pop.
+  fadeInSplat(mesh, () => hidePointCloudProxy(sceneId));
   console.log(`[viewer] splat loaded ${sceneId} in ${(performance.now() - t0).toFixed(0)}ms (${loadedSplatIds.length} loaded)`);
 }
 
@@ -1688,6 +1709,7 @@ async function transitionTo(scene) {
   try {
     loadPromise = loadSplatMesh(scene.ply_url, [0, 0, 0]).then(mesh => {
       splatMeshes.set(scene.id, mesh);
+      fadeInSplat(mesh); // no proxy in single-scene mode — just materialise
     });
   } catch (err) {
     console.error("loadSplatMesh threw:", err);
