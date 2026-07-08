@@ -111,7 +111,10 @@ async function playSceneAudio(scene, worldPos) {
   stopSceneAudio(scene.id);
 
   const ctx = getAudioCtx();
-  if (ctx.state === "suspended") await ctx.resume().catch(() => {});
+  // Never un-suspend a context the user muted — the source below still gets
+  // created/started, but a suspended context produces no sound at all, which
+  // is exactly what "music off" needs to mean regardless of what else happens.
+  if (!audioMuted && ctx.state === "suspended") await ctx.resume().catch(() => {});
 
   const buf = await _fetchAudioBuffer(scene.audio_url);
   if (!buf) return;
@@ -214,6 +217,14 @@ const SCENE_GAP     = 18;  // clear gap between scene bounding boxes, in world u
 const worldPositions = new Map(); // scene id → [x, y, z]
 // scene id → { xSpan, ySpan, zSpan } — measured from the proxy points
 const sceneExtents   = new Map();
+// scene id → [x, y, z], the MEAN of every proxy point in the scene's own
+// local space (i.e. an offset from worldPositions, not a world position by
+// itself). Used wherever "how far away is this scene" needs to mean the
+// actual mass of splats, not just the map slot it was placed at — see
+// sceneWorldCenter() below. A bounding-box centre ((min+max)/2) would get
+// dragged badly off by a handful of stray far-flung gaussians; the mean is
+// only pulled proportionally to how many points are actually out there.
+const sceneCentroids = new Map();
 
 // ── Ground-plane placement, shared with the main-page map ─────────────────
 // A memory's spot lives on the server as (x_pct, y_pct) in a unit square — the
@@ -305,13 +316,12 @@ function assignWorldPosition(scene) {
 function moveSceneTo(id, p) {
   worldPositions.set(id, p);
   const proxy = pointCloudProxies.get(id);
-  if (proxy) proxy.position.set(p[0], p[1], p[2]);
+  if (proxy) placeSceneObject(proxy, id, p);
   const src = _activeSources.get(id);
   if (src) src.worldPos = [p[0], p[1], p[2]];
+  // If its full splat is loaded, drop it — updateFullResLOD reloads it at the
+  // new spot next tick if it's still among the closest.
   if (loadedSplatIds.includes(id)) {
-    if (primaryId === id) primaryId = null;
-    const rp = splatRecency.indexOf(id);
-    if (rp !== -1) splatRecency.splice(rp, 1);
     enqueueSplatOp(`move-reload ${id}`, () => splatUnload(id));
   }
   refreshBoundaryBoxes();
@@ -363,19 +373,19 @@ async function mapWithConcurrency(items, limit, fn) {
 const POINT_CLOUD_MAX_POINTS = 12_000;
 // Base world-space point size at "1 unit from camera" — see uPixelScale below,
 // which turns this into an actual on-screen pixel size every frame.
-const POINT_SIZE = 0.35;
+const POINT_SIZE = 5;
 // Distance (world units) from the camera within which a point is fully
 // visible/at max size, and beyond which it fades all the way to invisible.
 // Tunable — these are a first pass; adjust to taste once you can see it live.
-const POINT_FADE_NEAR = 8;
+const POINT_FADE_NEAR = 1;
 const POINT_FADE_FAR  = 140;
 // On-screen size clamp in pixels: MAX makes close-up points read as "quite
 // large" instead of a fine mist; MIN keeps far-but-still-visible points from
 // shimmering at sub-pixel size. Keep MAX modest — each point is ONE flat,
 // unblended splat colour, so blowing it up too far turns a soft-looking
 // cloud into a mosaic of harsh, oversized, single-colour tiles.
-const POINT_MAX_PIXEL_SIZE = 14;
-const POINT_MIN_PIXEL_SIZE = 1.5;
+const POINT_MAX_PIXEL_SIZE = 80;
+const POINT_MIN_PIXEL_SIZE = 0;
 // Proxies are now tiny pre-decimated blobs (~180 KB) served by
 // /api/scene-proxy, not the full ~64 MB PLY — so we can fetch many at once.
 const PROXY_BUILD_CONCURRENCY = 8;
@@ -507,11 +517,14 @@ function recordExtentFromPoints(id, data) {
   if (sceneExtents.has(id)) return;
   const n = data.count;
   const xs = new Float32Array(n), ys = new Float32Array(n), zs = new Float32Array(n);
+  let sumX = 0, sumY = 0, sumZ = 0;
   for (let i = 0; i < n; i++) {
-    xs[i] = data.positions[i * 3];
-    ys[i] = data.positions[i * 3 + 1];
-    zs[i] = data.positions[i * 3 + 2];
+    const x = data.positions[i * 3], y = data.positions[i * 3 + 1], z = data.positions[i * 3 + 2];
+    xs[i] = x; ys[i] = y; zs[i] = z;
+    sumX += x; sumY += y; sumZ += z;
   }
+  sceneCentroids.set(id, [sumX / n, sumY / n, sumZ / n]);
+
   xs.sort(); ys.sort(); zs.sort();
   const lo = Math.floor(n * 0.05), hi = Math.max(lo, Math.ceil(n * 0.95) - 1);
   sceneExtents.set(id, {
@@ -519,6 +532,72 @@ function recordExtentFromPoints(id, data) {
     ySpan: Math.max(4, ys[hi] - ys[lo]),
     zSpan: Math.max(4, zs[hi] - zs[lo]),
   });
+}
+
+// World-space centre of mass for a scene: its map placement (worldPositions)
+// plus the local centroid offset measured above — this is "where the splats
+// actually are", as opposed to worldPositions alone, which is just the map
+// slot the memory was assigned and stays fixed regardless of how its own
+// content happens to be distributed around that slot's local origin. Falls
+// back to the placement position alone if the centroid isn't known yet
+// (proxy still loading).
+function sceneWorldCenter(id) {
+  const pos = worldPositions.get(id);
+  if (!pos) return null;
+  const c = sceneCentroids.get(id);
+  if (!c) return pos;
+  return [pos[0] + c[0], pos[1] + c[1], pos[2] + c[2]];
+}
+
+// ── Normalising memory size ───────────────────────────────────────────────
+// Different captures end up wildly different physical sizes (room size,
+// capture distance, etc.), which reads as inconsistent when walking between
+// memories that are supposed to feel like one collection. Scenes noticeably
+// bigger than their peers get scaled down toward the group's typical size;
+// nothing is ever scaled up (a tiny memory blown up just looks blurrier, not
+// "normal"), and nothing shrinks below its natural size either.
+const sceneScales = new Map(); // scene id → uniform scale factor, 1 = untouched
+let medianSceneSize = null;    // frozen per world-build; see establishSceneScales()
+const SCENE_SCALE_TOLERANCE = 1.3; // up to 30% larger than the median is left alone
+
+function sceneFootprintSize(id) {
+  const ext = sceneExtents.get(id);
+  return ext ? Math.max(ext.xSpan, ext.zSpan) : null;
+}
+
+function computeSceneScale(id) {
+  const size = sceneFootprintSize(id);
+  if (!size || !medianSceneSize) return 1;
+  return size > medianSceneSize * SCENE_SCALE_TOLERANCE ? medianSceneSize / size : 1;
+}
+
+// Call once extents are known for a full batch of scenes (a world build) to
+// (re)establish what "typical size" means for this set, then scale each one
+// against it. Incremental arrivals (poll()) just call computeSceneScale()
+// directly instead, measuring against this frozen baseline so already-placed
+// memories don't visibly resize out from under someone exploring the world.
+function establishSceneScales(sceneIds) {
+  const sizes = sceneIds.map(sceneFootprintSize).filter(Boolean).sort((a, b) => a - b);
+  if (sizes.length === 0) return;
+  medianSceneSize = sizes[Math.floor(sizes.length / 2)];
+  for (const id of sceneIds) sceneScales.set(id, computeSceneScale(id));
+}
+
+// Positions AND scales a point-cloud proxy or full splat mesh for a scene.
+// worldPos is just the map slot the memory was assigned — scaling around
+// that raw point would drag the scene's actual content off-slot, so this
+// nudges position by the centroid offset (scaled the same amount) to keep
+// the scene's own centre of mass anchored at worldPos + centroid regardless
+// of how much (if any) it got shrunk.
+function placeSceneObject(obj, id, worldPos) {
+  const scale = sceneScales.get(id) ?? 1;
+  const c = sceneCentroids.get(id) || [0, 0, 0];
+  obj.scale.setScalar(scale);
+  obj.position.set(
+    worldPos[0] + c[0] * (1 - scale),
+    worldPos[1] + c[1] * (1 - scale),
+    worldPos[2] + c[2] * (1 - scale),
+  );
 }
 
 async function addPointCloudProxy(scene, worldPos) {
@@ -544,7 +623,9 @@ async function addPointCloudProxy(scene, worldPos) {
     depthWrite: true,
   });
   const points = new THREE.Points(geometry, material);
-  points.position.set(worldPos[0], worldPos[1], worldPos[2]);
+  // No scale established yet for a scene this new (see establishSceneScales)
+  // — placeSceneObject degrades to scale=1, corrected once the batch is done.
+  placeSceneObject(points, scene.id, worldPos);
   viewer.threeScene.add(points);
   pointCloudProxies.set(scene.id, points);
   console.log(`[viewer] proxy ready for ${scene.id}: ${data.count} pts in ${(performance.now() - t0).toFixed(0)}ms`);
@@ -580,16 +661,20 @@ function refreshBoundaryBoxes() {
   if (!showBoundaryBoxes || !viewer) return;
   const liveIds = new Set();
   for (const s of worldScenes) {
-    const pos = worldPositions.get(s.id);
-    if (!pos) continue;
+    // Centred on sceneWorldCenter (not the raw placement slot) and scaled by
+    // the same factor placeSceneObject() renders at, so this box matches the
+    // scene's actual on-screen footprint — including any size normalisation.
+    const center = sceneWorldCenter(s.id);
+    if (!center) continue;
     liveIds.add(s.id);
     const ext = sceneExtents.get(s.id);
+    const scale = sceneScales.get(s.id) ?? 1;
     const half = ext
-      ? [ext.xSpan / 2, ext.ySpan / 2, ext.zSpan / 2]
+      ? [ext.xSpan / 2 * scale, ext.ySpan / 2 * scale, ext.zSpan / 2 * scale]
       : [WORLD_SPACING / 2, WORLD_SPACING / 2, WORLD_SPACING / 2];
     const box = new THREE.Box3(
-      new THREE.Vector3(pos[0] - half[0], pos[1] - half[1], pos[2] - half[2]),
-      new THREE.Vector3(pos[0] + half[0], pos[1] + half[1], pos[2] + half[2]),
+      new THREE.Vector3(center[0] - half[0], center[1] - half[1], center[2] - half[2]),
+      new THREE.Vector3(center[0] + half[0], center[1] + half[1], center[2] + half[2]),
     );
     const existing = boundaryBoxHelpers.get(s.id);
     if (existing) {
@@ -625,56 +710,24 @@ function setBoundaryBoxesVisible(enabled) {
   else clearBoundaryBoxes();
 }
 
-// ── Full-resolution splats: keep-one-loaded + preload-ahead ──────────────
-// Two ideas make the point-cloud → splat swap feel instant instead of a 10 s
-// freeze on arrival:
-//
-//   1. PRELOAD AHEAD. As the camera comes within FULLRES_PRELOAD_DIST of a
-//      scene, we start loading its full splat in the BACKGROUND while the
-//      scene we're currently standing in stays loaded. The expensive part
-//      (download + decode + GPU upload) overlaps the walk over, so by the
-//      time you arrive the splat is already there — the "swap" is just a
-//      pointer flip, no wait.
-//
-//   2. KEEP ONE LOADED. We never unload down to nothing. The current scene's
-//      splat stays up until a DIFFERENT scene has fully loaded and taken over.
-//      That's what stops the splat from vanishing when you walk deeper into a
-//      large scene (its centre falls outside the old exit radius) — there's no
-//      "too far, drop it" rule anymore, only "someone else is nearer, swap".
+// ── Full-resolution splats: load the closest N ───────────────────────────
+// One rule: the MAX_LOADED_SPLATS scenes closest to the camera are shown as
+// full gaussian splats; every other scene stays a lightweight point-cloud
+// proxy. As you move, "closest" is recomputed each tick and the loaded set
+// follows. No enter/exit distance, no direction, no preload/LRU — just
+// "closest is loaded". When the closest scene changes, the new one loads
+// before the old one is dropped, so the swap never leaves a blank frame.
 //
 // FULLRES_KEEP is the fraction of gaussians the server keeps in the on-demand
 // full-res splat (see /api/scene-splat). 1.0 = original ~1.17M-gaussian scene;
-// lower = lighter + proportionally faster to swap in, at some loss of
-// density. This is the main quality/speed dial.
+// lower = lighter + proportionally faster to load, at some loss of density.
 const FULLRES_KEEP        = 1;
-const FULLRES_ENTER_DIST  = 7;    // this scene becomes the one we're "in"
-const FULLRES_PRELOAD_DIST = 26;  // begin background-loading a scene from this far
-// How many full-res splats may stay resident at once. Rather than unloading a
-// scene the moment you leave it, we keep the N most-recently-visited loaded, so
-// stepping back to a memory you just saw is instant (no reload). Higher = more
-// instant revisits but more GPU memory. Lower it if the GPU is tight.
-const MAX_LOADED_SPLATS   = 1;
-// Spark loads each scene as its own independent SplatMesh (no shared add/
-// remove queue to race, unlike the old library), so there's no forced settle
-// gap between ops anymore. The queue below is kept only to stop the
-// reconciler's own bookkeeping (loadedSplatIds/splatRecency) from being
-// mutated by two operations at once.
-const SPLAT_OP_SETTLE_MS  = 0;
+const MAX_LOADED_SPLATS   = 2;
 
 function splatUrl(scene) {
   // Decimated (lighter) full-res splat when the backend offers it; the raw
   // full-quality PLY otherwise.
   return scene.splat_url ? `${scene.splat_url}?keep=${FULLRES_KEEP}` : scene.ply_url;
-}
-
-// Warm a scene's splat bytes into the browser cache (immutable response), so
-// the fetch() inside loadSplatMesh() that follows skips the download entirely.
-const _prefetchedPly = new Set();
-function prefetchScenePly(sceneId) {
-  if (!sceneId || _prefetchedPly.has(sceneId)) return;
-  _prefetchedPly.add(sceneId);
-  const scene = worldScenes.find(s => s.id === sceneId) || scenes.find(s => s.id === sceneId);
-  if (scene) fetch(splatUrl(scene), { cache: "force-cache" }).catch(() => {});
 }
 
 // Fetches a scene's PLY bytes and builds a Spark SplatMesh at the given
@@ -695,32 +748,19 @@ async function loadSplatMesh(url, position) {
   return mesh;
 }
 
-// ── Serialised splat op queue ────────────────────────────────────────────
-// EVERYTHING that adds/removes a splat scene goes through here, one at a
-// time, so the reconciler's own state (loadedSplatIds/splatRecency/etc.)
-// never gets mutated by two overlapping ops.
-let loadedSplatIds = [];          // scene ids currently loaded, insertion order
+// ── Serialised splat load/unload ─────────────────────────────────────────
+// Every add/remove goes through one queue, one at a time, so the loaded-set
+// bookkeeping never gets mutated by two overlapping ops.
+let loadedSplatIds = [];          // scene ids currently loaded
 let splatMeshes    = new Map();   // scene id -> SplatMesh currently in the scene
-let splatRecency   = [];          // loaded scene ids, oldest first, most-recently-used last (LRU)
-let primaryId      = null;        // the scene currently designated "we're here"
-let wantPrimaryId  = null;        // scene we want promoted to primary (LOD/focus target)
-let preloadId      = null;        // nearest non-primary scene we're preloading
-let focusRequestId = null;        // scene an explicit focus (click/auto/mobile) is flying to
-let splatBusy      = false;       // an add/remove is in flight (or settling)
-
-// Mark a scene as most-recently-used so the LRU keeps it around longest.
-function touchSplat(id) {
-  const i = splatRecency.indexOf(id);
-  if (i !== -1) splatRecency.splice(i, 1);
-  splatRecency.push(id);
-}
+let desiredIds     = [];          // scene ids that SHOULD be loaded (closest N)
+let splatBusy      = false;       // an add/remove is in flight
 
 function enqueueSplatOp(label, fn) {
   splatBusy = true;
   Promise.resolve()
     .then(fn)
     .catch(err => console.error(`[viewer] splat op '${label}' failed:`, err))
-    .then(() => new Promise(r => setTimeout(r, SPLAT_OP_SETTLE_MS)))
     .finally(() => { splatBusy = false; });
 }
 
@@ -729,10 +769,13 @@ async function splatLoad(sceneId) {
   const scene = worldScenes.find(s => s.id === sceneId) || scenes.find(s => s.id === sceneId);
   if (!scene) return;
   const t0 = performance.now();
-  const mesh = await loadSplatMesh(splatUrl(scene), worldPositions.get(sceneId) || [0, 0, 0]);
+  const pos = worldPositions.get(sceneId) || [0, 0, 0];
+  const mesh = await loadSplatMesh(splatUrl(scene), pos);
+  // Full-res quality gets the same size normalisation as its proxy, so the
+  // swap between them isn't also a jarring size change.
+  placeSceneObject(mesh, sceneId, pos);
   splatMeshes.set(sceneId, mesh);
   loadedSplatIds.push(sceneId);
-  touchSplat(sceneId);
   hidePointCloudProxy(sceneId);
   console.log(`[viewer] splat loaded ${sceneId} in ${(performance.now() - t0).toFixed(0)}ms (${loadedSplatIds.length} loaded)`);
 }
@@ -745,8 +788,6 @@ async function splatUnload(sceneId) {
   splatMeshes.delete(sceneId);
   const idx = loadedSplatIds.indexOf(sceneId);
   if (idx !== -1) loadedSplatIds.splice(idx, 1);
-  const r = splatRecency.indexOf(sceneId);
-  if (r !== -1) splatRecency.splice(r, 1);
   showPointCloudProxy(sceneId);
   console.log(`[viewer] splat unloaded ${sceneId} (${loadedSplatIds.length} loaded)`);
 }
@@ -754,20 +795,18 @@ async function splatUnload(sceneId) {
 function resetSplatState() {
   loadedSplatIds = [];
   splatMeshes = new Map();
-  splatRecency = [];
-  primaryId = wantPrimaryId = preloadId = focusRequestId = null;
+  desiredIds = [];
   splatBusy = false;
-  _prefetchedPly.clear();
 }
 
 // Debug render-mode toggle: "point cloud" forces every scene down to its
 // proxy and blocks reconcileSplats() from loading anything (see the guard
-// there) — "splat" (the normal default) resumes the usual proximity LOD.
+// there) — "splat" (the normal default) resumes the usual closest-N loading.
 let forcePointCloudOnly = false;
 
 function setPointCloudOnly(enabled) {
   forcePointCloudOnly = enabled;
-  if (!enabled) return; // normal LOD just picks back up next frame
+  if (!enabled) return; // normal loading just picks back up next frame
   splatBusy = true;
   (async () => {
     // Not routed through enqueueSplatOp — this needs to drain everything in
@@ -775,88 +814,52 @@ function setPointCloudOnly(enabled) {
     for (const id of [...loadedSplatIds]) {
       await splatUnload(id); // re-shows each scene's proxy as it unloads
     }
-    primaryId = wantPrimaryId = preloadId = focusRequestId = null;
+    desiredIds = [];
     splatBusy = false;
   })();
 }
 
-// Drives the loaded set toward what we want (the primary we're aiming at plus
-// the nearest neighbour we're preloading), while keeping up to
-// MAX_LOADED_SPLATS resident as an LRU cache so recently-visited memories stay
-// instant to return to. Does ONE op per call; ticks/LOD keep calling until
-// settled. Loading the wanted primary is prioritised, and the outgoing primary
-// is kept until the new one is fully in, so there's never an empty frame.
+// Nudge the loaded set one step toward desiredIds. Does ONE op per call;
+// updateFullResLOD keeps calling until settled. Loads a missing desired scene
+// before dropping any stale one, so a swap never blanks the view.
 function reconcileSplats() {
   if (!viewer || splatBusy || forcePointCloudOnly) return;
 
-  // Must-haves: never evict these, always load them.
-  const pinned = new Set();
-  if (wantPrimaryId) pinned.add(wantPrimaryId);
-  if (preloadId)     pinned.add(preloadId);
-  // Keep the current primary pinned until the incoming one has actually loaded.
-  if (primaryId && wantPrimaryId && wantPrimaryId !== primaryId && !loadedSplatIds.includes(wantPrimaryId)) {
-    pinned.add(primaryId);
-  }
-
-  // 1. Load the wanted primary first, then any preload, so what the visitor is
-  //    looking at resolves before we spend the budget on a neighbour.
-  const toLoad = (wantPrimaryId && !loadedSplatIds.includes(wantPrimaryId))
-    ? wantPrimaryId
-    : [...pinned].find(id => !loadedSplatIds.includes(id));
+  // 1. Load the closest desired scene that isn't loaded yet. This runs BEFORE
+  //    eviction so the incoming splat is up before the outgoing one leaves —
+  //    a swap never blanks the view.
+  const toLoad = desiredIds.find(id => !loadedSplatIds.includes(id));
   if (toLoad) { enqueueSplatOp(`load ${toLoad}`, () => splatLoad(toLoad)); return; }
 
-  // 2. Everything we need is loaded — the takeover is now just a pointer flip.
-  if (wantPrimaryId && primaryId !== wantPrimaryId) { primaryId = wantPrimaryId; touchSplat(primaryId); }
-
-  // 3. Evict only when over capacity, and only the least-recently-used scene
-  //    that isn't pinned — so the N most-recent memories linger, ready to snap
-  //    back the instant you return to one.
-  if (loadedSplatIds.length > MAX_LOADED_SPLATS) {
-    const victim = splatRecency.find(id => loadedSplatIds.includes(id) && !pinned.has(id));
-    if (victim) { enqueueSplatOp(`evict ${victim}`, () => splatUnload(victim)); return; }
-  }
+  // 2. Everything desired is loaded — now drop ANY loaded scene that's no
+  //    longer desired (not just when over the cap), so a fly across the world
+  //    can't leave a pile of stale splats loaded. Converges to exactly the
+  //    desired set once the camera settles.
+  const victim = loadedSplatIds.find(id => !desiredIds.includes(id));
+  if (victim) { enqueueSplatOp(`evict ${victim}`, () => splatUnload(victim)); return; }
 }
 
 // Called every few frames from updateLOD() with the camera's world position.
-// Only decides WHAT we want (wantPrimaryId / preloadId); reconcileSplats() does
-// the actual load/unload.
+// Picks the closest MAX_LOADED_SPLATS scenes as the desired set, then lets
+// reconcileSplats() load/unload toward it.
 function updateFullResLOD(cx, cy, cz) {
   if (!worldMode || worldScenes.length === 0) return;
 
-  let nearestId = null, nearestDist = Infinity;
+  // Rank by RAW distance to each scene's rendered centre of mass — the exact
+  // point placeSceneObject() puts its proxy/splat at, so "closest" means
+  // closest to what you actually see. No radius/edge fudge: subtracting a
+  // footprint radius and clamping at 0 made every scene you're roughly inside
+  // tie at distance 0, and with one splat slot the tie went to list order —
+  // so a scene you're standing in could never win the slot from an earlier-
+  // listed neighbour no matter how close you got.
+  const ranked = [];
   for (const s of worldScenes) {
-    const pos = worldPositions.get(s.id);
-    if (!pos) continue;
-    const ext = sceneExtents.get(s.id);
-    // Distance to the scene's edge (centre minus a rough radius) rather than
-    // its centre, so a large scene still counts as "here" while you're inside
-    // it instead of reading as far away the moment you pass its middle.
-    const radius = ext ? Math.max(ext.xSpan, ext.zSpan) * 0.5 : 0;
-    const d = Math.max(0, Math.hypot(cx - pos[0], cy - pos[1], cz - pos[2]) - radius);
-    if (d < nearestDist) { nearestDist = d; nearestId = s.id; }
+    const center = sceneWorldCenter(s.id);
+    if (!center) continue;
+    ranked.push({ id: s.id, d: Math.hypot(cx - center[0], cy - center[1], cz - center[2]) });
   }
-
-  // An explicit focus (click / auto-advance / mobile pick) wins until it's
-  // actually reached — otherwise this proximity pass would keep yanking
-  // wantPrimaryId back to the scene we're flying away from. Clear it once the
-  // focused scene has become primary.
-  if (focusRequestId && focusRequestId === primaryId) focusRequestId = null;
-
-  // Preload the nearest not-yet-primary scene as we get within range (and
-  // always the focus target, so it's building while the camera flies over).
-  preloadId = (nearestId && nearestId !== primaryId && nearestDist < FULLRES_PRELOAD_DIST) ? nearestId : null;
-  if (focusRequestId && focusRequestId !== primaryId) preloadId = focusRequestId;
-  if (preloadId) prefetchScenePly(preloadId);
-
-  if (focusRequestId && focusRequestId !== primaryId) {
-    wantPrimaryId = focusRequestId;                 // hold the focus target
-  } else if (nearestId && nearestDist < FULLRES_ENTER_DIST) {
-    wantPrimaryId = nearestId;                       // promote whoever we're near
-  } else if (!primaryId) {
-    wantPrimaryId = null;                            // nothing loaded, nothing near yet
-  } else {
-    wantPrimaryId = primaryId;                       // hold current — never unload to nothing
-  }
+  ranked.sort((a, b) => a.d - b.d);
+  desiredIds = ranked.slice(0, MAX_LOADED_SPLATS).map(r => r.id);
 
   reconcileSplats();
 }
@@ -867,14 +870,9 @@ function updateFullResLOD(cx, cy, cz) {
 function focusWorldScene(sceneId, worldPos) {
   flyToScene(worldPos, true);
   worldFocusedId = sceneId;
-  // Explicit focus (click, mobile selection, auto-advance) always warrants
-  // full quality. Aim the reconciler at it and start loading immediately, so
-  // the splat is already materialising while the camera flies over — same
-  // path as proximity LOD, so the two never race each other.
-  focusRequestId = sceneId;
-  wantPrimaryId = sceneId;
-  prefetchScenePly(sceneId);
-  reconcileSplats();
+  // Splat loading is purely distance-driven (see updateFullResLOD) — this
+  // click/auto-advance/mobile-pick just flies the camera over; the splat
+  // loads on its own once the camera is the closest thing to that scene.
   // Update auto-advance index so it continues from the current scene
   const idx = worldScenes.findIndex(s => s.id === sceneId);
   if (idx !== -1) _worldAutoIndex = idx;
@@ -1656,10 +1654,11 @@ async function buildWorldMode(sceneIds) {
     // slide each proxy to its final home and re-frame the overview so the whole
     // 3D cloud fits the view.
     relayoutWorldEven(targetScenes);
+    establishSceneScales(targetScenes.map(s => s.id));
     for (const s of targetScenes) {
       const p   = pointCloudProxies.get(s.id);
       const pos = worldPositions.get(s.id);
-      if (p && pos) p.position.set(pos[0], pos[1], pos[2]);
+      if (p && pos) placeSceneObject(p, s.id, pos);
     }
     refreshBoundaryBoxes();
     if (viewer?.camera && DEBUG_LIMIT == null) {
@@ -1826,6 +1825,15 @@ async function poll() {
               console.error("[viewer] poll: failed adding proxy for new memory:", s.id, err);
             }
           });
+          // Measure against the existing (frozen) median rather than
+          // re-establishing it, so memories already on display don't
+          // visibly resize just because a new arrival changed the average.
+          for (const s of fresh) {
+            const pos = worldPositions.get(s.id);
+            const p   = pointCloudProxies.get(s.id);
+            sceneScales.set(s.id, computeSceneScale(s.id));
+            if (p && pos) placeSceneObject(p, s.id, pos);
+          }
           refreshBoundaryBoxes();
           console.log(`[viewer] poll: added ${fresh.length} scene(s) to world in ${(performance.now() - t0).toFixed(0)}ms`);
         }
@@ -1940,10 +1948,9 @@ function isFullscreen() {
 let _fullscreenRequested = false;
 
 function enterFullscreen() {
-  // Guards against the document-level pointerdown listener and the splash
-  // Start button both firing for the same physical click — a second
-  // requestFullscreen() call before the first one resolves logs a harmless
-  // but noisy "can only be initiated by a user gesture" warning.
+  // Guards against a double-click firing this twice before the first
+  // requestFullscreen() call resolves — that second call would otherwise log
+  // a harmless but noisy "can only be initiated by a user gesture" warning.
   if (_fullscreenRequested || isFullscreen() || !document.documentElement.requestFullscreen) return;
   _fullscreenRequested = true;
   document.documentElement.requestFullscreen()
@@ -1959,10 +1966,8 @@ function toggleFullscreen() {
   }
 }
 
-// Browsers require a user gesture to enter fullscreen — grab the very first
-// tap/click/keypress on the kiosk and use it to go fullscreen automatically.
-document.addEventListener("pointerdown", enterFullscreen, { once: true });
-document.addEventListener("keydown", enterFullscreen, { once: true });
+// Fullscreen is opt-in only — the bottom-right button and the F key (below)
+// are the only two things that ever call toggleFullscreen()/enterFullscreen().
 
 // Placeholder stays visible until buildWorldMode finishes loading all scenes
 
