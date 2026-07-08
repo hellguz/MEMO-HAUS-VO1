@@ -1524,7 +1524,11 @@ a.tab-btn { text-decoration: none; }
   width: 0; height: 0;
   pointer-events: none;
   z-index: 2;
-  transition: left 0.18s linear, top 0.18s linear, transform 0.18s linear;
+  /* Only smooth position, NOT rotation: the heading (a CSS rotate in degrees)
+     wraps from +180 to -180 as the view crosses straight-ahead, and animating
+     that jump makes the arrow spin ~360° — which reads as a random 180 flip.
+     Snapping the rotation instantly avoids it. */
+  transition: left 0.18s linear, top 0.18s linear;
 }
 .map-camera-cone {
   position: absolute;
