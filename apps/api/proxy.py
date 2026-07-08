@@ -101,8 +101,14 @@ def build_proxy_bytes(ply_path: Path, max_points: int = 12_000) -> bytes:
     rgb = np.empty((n, 3), dtype=np.uint8)
     if all(f"f_dc_{i}" in fields for i in range(3)):
         for i in range(3):
+            # Standard 3DGS spherical-harmonics DC term -> base RGB:
+            #   colour = 0.5 + SH_C0 * f_dc
+            # The previous `f_dc / SH_C0 * 0.5 + 0.5` scaled the coefficient by
+            # ~1.77 instead of ~0.28 (≈6.3x too hot), so nearly every channel
+            # clipped to 0 or 1 — that's what made the proxy points look
+            # blown-out and over-saturated next to the (correct) splats.
             c = column(f"f_dc_{i}").astype("<f4")
-            c = np.clip(c / SH_C0 * 0.5 + 0.5, 0.0, 1.0) * 255.0
+            c = np.clip(SH_C0 * c + 0.5, 0.0, 1.0) * 255.0
             rgb[:, i] = c.astype(np.uint8)
     elif all(k in fields for k in ("red", "green", "blue")):
         rgb[:, 0] = column("red")
@@ -171,22 +177,6 @@ def get_or_build_lite_ply(ply_path: Path, keep: float = 0.4) -> Path:
         return out
     data = build_decimated_ply(ply_path, keep)
     tmp = out.with_suffix(out.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(out)
-    return out
-
-
-def proxy_path_for(ply_path: Path) -> Path:
-    return ply_path.with_suffix(".proxy")
-
-
-def get_or_build_proxy(ply_path: Path, max_points: int = 12_000) -> Path:
-    """Return a path to the cached proxy blob, building it if missing/stale."""
-    out = proxy_path_for(ply_path)
-    if out.exists() and out.stat().st_mtime >= ply_path.stat().st_mtime:
-        return out
-    data = build_proxy_bytes(ply_path, max_points)
-    tmp = out.with_suffix(".proxy.tmp")
     tmp.write_bytes(data)
     tmp.replace(out)
     return out

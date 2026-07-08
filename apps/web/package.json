@@ -9,8 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@mkkellogg/gaussian-splats-3d": "^0.4.6",
-    "three": "^0.165.0"
+    "@sparkjsdev/spark": "^2.1.0",
+    "three": "^0.180.0"
   },
   "devDependencies": {
     "vite": "^5.4.0"

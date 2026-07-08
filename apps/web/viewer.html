@@ -147,6 +147,15 @@
 
     <!-- Reset button and instructions removed; nav controlled via mobile app -->
 
+    <!-- Debug / utility controls -->
+    <div id="debug-controls" class="debug-controls">
+      <button id="btn-boxes" class="debug-btn" type="button" title="Show memory boundary boxes" aria-pressed="false">▢</button>
+      <button id="btn-music" class="debug-btn active" type="button" title="Toggle music" aria-pressed="true">♪</button>
+      <button id="btn-slideshow" class="debug-btn" type="button" title="Toggle slideshow (auto-advance between memories)" aria-pressed="false">▶</button>
+      <button id="btn-fullscreen" class="debug-btn" type="button" title="Toggle fullscreen" aria-pressed="false">⛶</button>
+      <button id="btn-render-mode" class="debug-btn" type="button" title="Toggle splat / point-cloud rendering" aria-pressed="false">SPLAT</button>
+    </div>
+
     <script type="module" src="/src/viewer.js"></script>
   </body>
 </html>
