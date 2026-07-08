@@ -1,6 +1,6 @@
 import "./viewer.css";
 import * as THREE from "three";
-import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
+import { SparkRenderer, SplatMesh, SplatFileType } from "@sparkjsdev/spark";
 
 const viewerEl      = document.getElementById("viewer");
 const placeholderEl   = document.getElementById("placeholder");
@@ -168,8 +168,11 @@ const OVERLAY_FADE_MS = 480;
 const ERROR_SHOW_MS   = 4_000;
 const TIMER_C         = 100.53; // 2π × 16
 
-const INIT_POS    = [0, 0, -3];   // must match initialCameraPosition
-const INIT_TARGET = [0, 0, 1];    // must match initialCameraLookAt
+const INIT_POS    = [0, 0, -3];   // camera spawn point
+// Direction the camera faces at _yaw=0/_pitch=0 (applyFPSCamera()'s default)
+// is +Z, so from INIT_POS this looks toward the origin — kept here as a note,
+// not passed anywhere, since there's no separate "look-at" option to set.
+const INIT_TARGET = [0, 0, 1];
 
 let viewer        = null;
 let scenes        = [];
@@ -280,7 +283,7 @@ function assignWorldPosition(scene) {
 
 // Live-move a memory to a new world position: slide its proxy and audio right
 // away, and if its full splat is loaded, drop it so it reloads at the new spot
-// when next approached (the library pins a splat's position at load time).
+// when next approached, same as everywhere else a splat gets positioned.
 function moveSceneTo(id, p) {
   worldPositions.set(id, p);
   const proxy = pointCloudProxies.get(id);
@@ -334,7 +337,7 @@ async function mapWithConcurrency(items, limit, fn) {
 // the splat centers + colours as plain THREE.Points (a few thousand points,
 // heavily decimated), rendered straight into the viewer's own THREE scene —
 // entirely outside the gaussian-splat pipeline, so no covariance textures,
-// no per-splat sorting, no octree. That pipeline is what a laptop actually
+// no per-splat sorting, no LOD tree. That pipeline is what a laptop actually
 // chokes on with 10 full splats loaded at once (~23M gaussians); a scene's
 // full quality only ever loads for whichever ONE scene the visitor is
 // currently near, everything else stays a lightweight point cloud.
@@ -435,7 +438,7 @@ function clearPointCloudProxies() {
 //   1. PRELOAD AHEAD. As the camera comes within FULLRES_PRELOAD_DIST of a
 //      scene, we start loading its full splat in the BACKGROUND while the
 //      scene we're currently standing in stays loaded. The expensive part
-//      (download + octree/SplatTree build) overlaps the walk over, so by the
+//      (download + decode + GPU upload) overlaps the walk over, so by the
 //      time you arrive the splat is already there — the "swap" is just a
 //      pointer flip, no wait.
 //
@@ -446,9 +449,9 @@ function clearPointCloudProxies() {
 //      "too far, drop it" rule anymore, only "someone else is nearer, swap".
 //
 // FULLRES_KEEP is the fraction of gaussians the server keeps in the on-demand
-// full-res splat (see /api/scene-splat). 1.0 = original ~1.17M-gaussian scene
-// (~2.6 s octree build); lower = lighter + proportionally faster to swap in,
-// at some loss of density. This is the main quality/speed dial.
+// full-res splat (see /api/scene-splat). 1.0 = original ~1.17M-gaussian scene;
+// lower = lighter + proportionally faster to swap in, at some loss of
+// density. This is the main quality/speed dial.
 const FULLRES_KEEP        = 0.5;
 const FULLRES_ENTER_DIST  = 7;    // this scene becomes the one we're "in"
 const FULLRES_PRELOAD_DIST = 26;  // begin background-loading a scene from this far
@@ -457,13 +460,12 @@ const FULLRES_PRELOAD_DIST = 26;  // begin background-loading a scene from this 
 // stepping back to a memory you just saw is instant (no reload). Higher = more
 // instant revisits but more GPU memory. Lower it if the GPU is tight.
 const MAX_LOADED_SPLATS   = 4;
-// After each add/remove the library keeps rebuilding its splat-tree in the
-// background with no public "done" hook; kicking off the next op too soon is
-// what threw "reading 'visitLeaves'". We serialise ops through one queue AND
-// leave this settle gap between them. It never delays anything the user sees:
-// the visible takeover is a pointer flip once a scene is already loaded, and
-// both the preload and the old-scene unload are off-screen background work.
-const SPLAT_OP_SETTLE_MS  = 900;
+// Spark loads each scene as its own independent SplatMesh (no shared add/
+// remove queue to race, unlike the old library), so there's no forced settle
+// gap between ops anymore. The queue below is kept only to stop the
+// reconciler's own bookkeeping (loadedSplatIds/splatRecency) from being
+// mutated by two operations at once.
+const SPLAT_OP_SETTLE_MS  = 0;
 
 function splatUrl(scene) {
   // Decimated (lighter) full-res splat when the backend offers it; the raw
@@ -472,7 +474,7 @@ function splatUrl(scene) {
 }
 
 // Warm a scene's splat bytes into the browser cache (immutable response), so
-// the addSplatScene() that follows skips the download entirely.
+// the fetch() inside loadSplatMesh() that follows skips the download entirely.
 const _prefetchedPly = new Set();
 function prefetchScenePly(sceneId) {
   if (!sceneId || _prefetchedPly.has(sceneId)) return;
@@ -481,11 +483,30 @@ function prefetchScenePly(sceneId) {
   if (scene) fetch(splatUrl(scene), { cache: "force-cache" }).catch(() => {});
 }
 
+// Fetches a scene's PLY bytes and builds a Spark SplatMesh at the given
+// position. Fetched manually (rather than passing the URL straight to
+// SplatMesh) because these URLs have no file extension for Spark's own
+// format-sniffing to key off (they're routed through /api/scene-splat).
+async function loadSplatMesh(url, position) {
+  const res = await withLoadRetry(async () => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`HTTP ${r.status} loading ${url}`);
+    return r;
+  });
+  const fileBytes = await res.arrayBuffer();
+  const mesh = new SplatMesh({ fileBytes, fileType: SplatFileType.PLY });
+  mesh.position.set(position[0], position[1], position[2]);
+  viewer.threeScene.add(mesh);
+  await mesh.initialized;
+  return mesh;
+}
+
 // ── Serialised splat op queue ────────────────────────────────────────────
-// EVERYTHING that adds/removes a splat scene goes through here, one at a time,
-// with a settle gap after each — the only safe way to drive the library's
-// add/remove without racing its background tree rebuild.
-let loadedSplatIds = [];          // scene ids currently loaded, in library index order
+// EVERYTHING that adds/removes a splat scene goes through here, one at a
+// time, so the reconciler's own state (loadedSplatIds/splatRecency/etc.)
+// never gets mutated by two overlapping ops.
+let loadedSplatIds = [];          // scene ids currently loaded, insertion order
+let splatMeshes    = new Map();   // scene id -> SplatMesh currently in the scene
 let splatRecency   = [];          // loaded scene ids, oldest first, most-recently-used last (LRU)
 let primaryId      = null;        // the scene currently designated "we're here"
 let wantPrimaryId  = null;        // scene we want promoted to primary (LOD/focus target)
@@ -514,12 +535,8 @@ async function splatLoad(sceneId) {
   const scene = worldScenes.find(s => s.id === sceneId) || scenes.find(s => s.id === sceneId);
   if (!scene) return;
   const t0 = performance.now();
-  await withLoadRetry(() => viewer.addSplatScene(splatUrl(scene), {
-    format: GaussianSplats3D.SceneFormat.Ply,
-    splatAlphaRemovalThreshold: 5,
-    showLoadingUI: false,
-    position: worldPositions.get(sceneId) || [0, 0, 0],
-  }));
+  const mesh = await loadSplatMesh(splatUrl(scene), worldPositions.get(sceneId) || [0, 0, 0]);
+  splatMeshes.set(sceneId, mesh);
   loadedSplatIds.push(sceneId);
   touchSplat(sceneId);
   hidePointCloudProxy(sceneId);
@@ -527,10 +544,13 @@ async function splatLoad(sceneId) {
 }
 
 async function splatUnload(sceneId) {
+  const mesh = splatMeshes.get(sceneId);
+  if (!mesh || !viewer) return;
+  viewer.threeScene.remove(mesh);
+  mesh.dispose();
+  splatMeshes.delete(sceneId);
   const idx = loadedSplatIds.indexOf(sceneId);
-  if (idx === -1 || !viewer) return;
-  await withLoadRetry(() => viewer.removeSplatScenes([idx], false));
-  loadedSplatIds.splice(idx, 1);           // mirror the library's index shift
+  if (idx !== -1) loadedSplatIds.splice(idx, 1);
   const r = splatRecency.indexOf(sceneId);
   if (r !== -1) splatRecency.splice(r, 1);
   showPointCloudProxy(sceneId);
@@ -539,6 +559,7 @@ async function splatUnload(sceneId) {
 
 function resetSplatState() {
   loadedSplatIds = [];
+  splatMeshes = new Map();
   splatRecency = [];
   primaryId = wantPrimaryId = preloadId = focusRequestId = null;
   splatBusy = false;
@@ -934,35 +955,45 @@ function _worldAdvance() {
   }
 }
 
-// ── Gaussian viewer ───────────────────────────────────────────────────────
+// ── Gaussian viewer (Spark) ──────────────────────────────────────────────
+// There's no all-in-one "Viewer" class here like the old library had — Spark
+// is just a THREE.Object3D (SparkRenderer) you add to a normal THREE scene,
+// so we own the scene/camera/renderer/render-loop directly. `viewer` keeps
+// the same shape (.camera / .threeScene) the rest of this file already
+// expects, to keep this swap as close to a drop-in as possible.
+//
+// No built-in controls to disable here (unlike the old library, which had
+// its own OrbitControls + a window-level keydown handler that had to be
+// turned off) — camera control has always been our own applyFPSCamera()/
+// flyLoop() below, driving a plain THREE.PerspectiveCamera.
 
 function ensureViewer() {
   if (viewer) return;
-  console.log("[viewer] creating GaussianSplats3D.Viewer");
-  viewer = new GaussianSplats3D.Viewer({
-    rootElement: viewerEl,
-    cameraUp: [0, -1, 0],
-    initialCameraPosition: INIT_POS,
-    initialCameraLookAt:   INIT_TARGET,
-    sharedMemoryForWorkers: false,
-    // The library's built-in controls create their own OrbitControls AND a
-    // separate window-level keydown handler that rolls the camera on
-    // ArrowLeft/ArrowRight (and binds KeyG/F/C/U/I/O/P to debug toggles).
-    // That handler is what was tilting the scene on arrow-key presses —
-    // disabling it entirely is the only way to stop it, since it runs
-    // independently of any OrbitControls.enabled flag.
-    useBuiltInControls: false,
-    // Surfaces the library's own internal timings (splat-tree/octree build
-    // time, sorting-worker setup) in the console — the part of "loading a
-    // scene" that happens AFTER addSplatScene's promise resolves and isn't
-    // otherwise visible from viewer.js.
-    logLevel: GaussianSplats3D.LogLevel.Info,
-  });
-  viewer.start();
-  console.log("[viewer] viewer.start() called");
+  console.log("[viewer] creating Spark renderer");
 
-  // Apply initial FPS look direction once camera is ready
-  requestAnimationFrame(() => applyFPSCamera());
+  // Matches the ~55°/tan≈0.52 FOV assumed by worldOverviewPos()'s framing math.
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.05, 4000);
+  camera.position.set(...INIT_POS);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: false }); // AA doesn't help splats, only costs perf (Spark docs)
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  viewerEl.appendChild(renderer.domElement);
+
+  const threeScene = new THREE.Scene();
+  const spark = new SparkRenderer({ renderer });
+  threeScene.add(spark);
+
+  window.addEventListener("resize", () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  viewer = { camera, threeScene, renderer, spark };
+  applyFPSCamera();
+  console.log("[viewer] Spark renderer ready");
 }
 
 // ── FPS camera state ──────────────────────────────────────────────────────
@@ -1442,11 +1473,8 @@ async function buildWorldMode(sceneIds) {
 
 // ── Transition ────────────────────────────────────────────────────────────
 
-// The library's internal "is loading" flag can apparently take a beat
-// longer to clear than the promise it returns suggests — calling
-// addSplatScene(s) again too soon throws "Cannot add splat scene while
-// another load or unload is already in progress." A few short retries
-// absorbs that instead of the whole operation failing outright.
+// Network fetches can flake (especially the ~64MB full-res PLYs) — a couple
+// of short retries absorbs that instead of the whole load failing outright.
 async function withLoadRetry(fn, attempts = 3, delayMs = 150) {
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
@@ -1459,11 +1487,12 @@ async function withLoadRetry(fn, attempts = 3, delayMs = 150) {
 }
 
 async function removeAllScenes() {
-  const oldCount = viewer ? viewer.getSceneCount() : 0;
-  if (oldCount === 0 || !viewer) return;
-  await withLoadRetry(() =>
-    viewer.removeSplatScenes(Array.from({ length: oldCount }, (_, i) => i), false)
-  );
+  if (!viewer) return;
+  for (const mesh of splatMeshes.values()) {
+    viewer.threeScene.remove(mesh);
+    mesh.dispose();
+  }
+  splatMeshes.clear();
 }
 
 async function transitionTo(scene) {
@@ -1478,17 +1507,13 @@ async function transitionTo(scene) {
   placeholderEl.classList.add("hidden");
   ensureViewer();
 
-  // progressiveLoad streams the PLY so the forming materialisation is visible
   let loadPromise;
   try {
-    loadPromise = viewer.addSplatScene(scene.ply_url, {
-      format: GaussianSplats3D.SceneFormat.Ply,
-      splatAlphaRemovalThreshold: 5,
-      showLoadingUI: false,
-      progressiveLoad: true,
+    loadPromise = loadSplatMesh(scene.ply_url, [0, 0, 0]).then(mesh => {
+      splatMeshes.set(scene.id, mesh);
     });
   } catch (err) {
-    console.error("addSplatScene threw:", err);
+    console.error("loadSplatMesh threw:", err);
     await overlayTo(0);
     return null;
   }
@@ -1513,11 +1538,9 @@ function goToIndex(index) {
     try {
       const loadPromise = await transitionTo(scene);
       // Must actually wait for the splat to finish loading here, inside the
-      // exclusive lock — addSplatScene()/removeSplatScenes() throw if called
-      // again while a previous one is still in flight. Releasing the lock
-      // before this settles (the old behaviour) let the next goToIndex call
-      // collide mid-load, which is exactly what was producing "wrong scene,
-      // audio doesn't match, jumps around fast".
+      // exclusive lock — releasing it before this settles let the next
+      // goToIndex call collide mid-load, which is exactly what was producing
+      // "wrong scene, audio doesn't match, jumps around fast".
       if (loadPromise) {
         try {
           await loadPromise;
@@ -1812,7 +1835,9 @@ function updateLOD() {
     return;
   }
 
-  if (!viewer?.splatMesh?.material?.uniforms) return; // uniforms absent until the scene loads
+  // Single-scene mode always loads at most one mesh (see transitionTo()).
+  const mesh = splatMeshes.values().next().value;
+  if (!mesh) return; // nothing loaded yet
 
   const minDist = Math.hypot(cx, cy, cz);
   const targetScale = lodScale(minDist, 10, 32, 0.20);
@@ -1822,7 +1847,7 @@ function updateLOD() {
   _lodPrevDist = minDist;
 
   _lodCurrentScale += (targetScale - _lodCurrentScale) * lerp * 3;
-  try { viewer.splatMesh.setSplatScale(Math.max(0.10, _lodCurrentScale)); } catch {}
+  mesh.scale.setScalar(Math.max(0.10, _lodCurrentScale));
 }
 
 // Throttled POST of the camera pose (position on the ground plane + yaw) for
@@ -1885,46 +1910,50 @@ function flyLoop() {
   // can show where the viewer is and which way it's looking.
   postCameraState();
 
-  if (!viewer || _keys.size === 0) return;
+  if (viewer && _keys.size > 0) {
+    const cam = viewer.camera;
+    if (cam) {
+      // Camera axes from world matrix — always current after applyFPSCamera()
+      const m = cam.matrixWorld.elements;
+      const right   = { x: m[0],  y: m[1],  z: m[2]  };
+      const camUp   = { x: m[4],  y: m[5],  z: m[6]  };
+      const forward = { x: -m[8], y: -m[9], z: -m[10] };
 
-  const cam = viewer.camera;
-  if (!cam) return;
+      const sprint = _keys.has("ShiftLeft") || _keys.has("ShiftRight");
+      const speed  = BASE_SPEED * (sprint ? 4 : 1);
 
-  // Camera axes from world matrix — always current after applyFPSCamera()
-  const m = cam.matrixWorld.elements;
-  const right   = { x: m[0],  y: m[1],  z: m[2]  };
-  const camUp   = { x: m[4],  y: m[5],  z: m[6]  };
-  const forward = { x: -m[8], y: -m[9], z: -m[10] };
+      let dx = 0, dy = 0, dz = 0;
+      const add = (v, s) => { dx += v.x * s; dy += v.y * s; dz += v.z * s; };
 
-  const sprint = _keys.has("ShiftLeft") || _keys.has("ShiftRight");
-  const speed  = BASE_SPEED * (sprint ? 4 : 1);
+      // W/S + Up/Down: forward/back. A/D: strafe sideways. E/Q: up/down.
+      if (_keys.has("KeyW") || _keys.has("ArrowUp"))    add(forward,  speed);
+      if (_keys.has("KeyS") || _keys.has("ArrowDown"))  add(forward, -speed);
+      if (_keys.has("KeyA"))                            add(right,   -speed);
+      if (_keys.has("KeyD"))                            add(right,    speed);
+      if (_keys.has("KeyE") || _keys.has("PageUp"))     add(camUp,    speed);
+      if (_keys.has("KeyQ") || _keys.has("PageDown"))   add(camUp,   -speed);
 
-  let dx = 0, dy = 0, dz = 0;
-  const add = (v, s) => { dx += v.x * s; dy += v.y * s; dz += v.z * s; };
+      // Side arrow keys turn your head (yaw) instead of strafing
+      let turned = false;
+      if (_keys.has("ArrowLeft"))  { _yaw -= TURN_SPEED; turned = true; }
+      if (_keys.has("ArrowRight")) { _yaw += TURN_SPEED; turned = true; }
+      if (turned) {
+        // Keep yaw bounded so it never loses precision in a long-running kiosk
+        _yaw = ((_yaw + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+      }
 
-  // W/S + Up/Down: forward/back. A/D: strafe sideways. E/Q: up/down.
-  if (_keys.has("KeyW") || _keys.has("ArrowUp"))    add(forward,  speed);
-  if (_keys.has("KeyS") || _keys.has("ArrowDown"))  add(forward, -speed);
-  if (_keys.has("KeyA"))                            add(right,   -speed);
-  if (_keys.has("KeyD"))                            add(right,    speed);
-  if (_keys.has("KeyE") || _keys.has("PageUp"))     add(camUp,    speed);
-  if (_keys.has("KeyQ") || _keys.has("PageDown"))   add(camUp,   -speed);
-
-  // Side arrow keys turn your head (yaw) instead of strafing
-  let turned = false;
-  if (_keys.has("ArrowLeft"))  { _yaw -= TURN_SPEED; turned = true; }
-  if (_keys.has("ArrowRight")) { _yaw += TURN_SPEED; turned = true; }
-  if (turned) {
-    // Keep yaw bounded so it never loses precision in a long-running kiosk
-    _yaw = ((_yaw + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+      if (dx !== 0 || dy !== 0 || dz !== 0 || turned) {
+        cam.position.x += dx;
+        cam.position.y += dy;
+        cam.position.z += dz;
+        applyFPSCamera();  // re-apply look direction after position/yaw changes
+      }
+    }
   }
 
-  if (dx !== 0 || dy !== 0 || dz !== 0 || turned) {
-    cam.position.x += dx;
-    cam.position.y += dy;
-    cam.position.z += dz;
-    applyFPSCamera();  // re-apply look direction after position/yaw changes
-  }
+  // Actually draw the frame — Spark hooks into this via SparkRenderer's
+  // onBeforeRender, so a normal renderer.render() call is all it needs.
+  if (viewer) viewer.renderer.render(viewer.threeScene, viewer.camera);
 }
 
 flyLoop();
