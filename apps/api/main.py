@@ -20,7 +20,7 @@ from pathlib import Path
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -199,30 +199,22 @@ def _ensure_warmup_started() -> None:
     threading.Thread(target=_warmup, name="sharp-warmup", daemon=True).start()
 
 
-def _warm_proxies() -> None:
-    """Pre-build the tiny viewer proxy blobs for every existing scene so the
-    first visitor's viewer boots instantly instead of triggering 30-odd
-    on-demand builds. Cheap (~0.05 s/scene) and cached to disk afterwards.
-    Also backfills a map position for any scene that doesn't have one yet, so
-    every memory has a spot the moment the viewer/map opens."""
+def _backfill_positions() -> None:
+    """Give every existing scene a map position if it doesn't have one yet, so
+    every memory has a spot the moment the viewer/map opens. (Proxies are now
+    built fresh per request and aren't cached, so there's nothing to pre-warm.)"""
     try:
         for scene in storage.list_scenes():
             if scene.id not in _scene_positions:
                 _assign_free_position(scene.id)
-            ply = storage.splats_dir / scene.ply_file
-            if ply.exists():
-                try:
-                    proxy_mod.get_or_build_proxy(ply)
-                except Exception:
-                    LOGGER.exception("Failed pre-warming proxy for %s", scene.id)
     except Exception:
-        LOGGER.exception("Proxy pre-warm pass failed")
+        LOGGER.exception("Position backfill pass failed")
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     LOGGER.info("Storage at %s", STORAGE_DIR)
-    threading.Thread(target=_warm_proxies, name="proxy-warmup", daemon=True).start()
+    threading.Thread(target=_backfill_positions, name="position-backfill", daemon=True).start()
 
 
 @app.get("/api/health")
@@ -242,23 +234,24 @@ def scenes() -> list[dict]:
 
 
 @app.get("/api/scene-proxy/{scene_id}")
-def scene_proxy(scene_id: str) -> FileResponse:
-    """Tiny pre-decimated point cloud (~180 KB) for the viewer's distant-view
+def scene_proxy(scene_id: str) -> Response:
+    """Tiny decimated point cloud (~180 KB) for the viewer's distant-view
     layer, so it never has to download the full ~64 MB PLY just to draw a few
-    thousand preview points. Built once on first request and cached to disk
-    next to the PLY; see proxy.py for the blob format."""
+    thousand preview points. Built fresh in-memory each request (a few tens of
+    ms, see proxy.py) and NOT cached — not on disk, not in the browser — so
+    changes to the decimation/colour code always take effect on reload."""
     ply_path = storage.splats_dir / f"{scene_id}.ply"
     if not ply_path.exists():
         raise HTTPException(status_code=404, detail="scene not found")
     try:
-        out = proxy_mod.get_or_build_proxy(ply_path)
+        data = proxy_mod.build_proxy_bytes(ply_path)
     except Exception as exc:  # pragma: no cover - surfaced to the client
         LOGGER.exception("Failed building proxy for %s", scene_id)
         raise HTTPException(status_code=500, detail=f"proxy build failed: {exc}")
-    return FileResponse(
-        out,
+    return Response(
+        content=data,
         media_type="application/octet-stream",
-        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        headers={"Cache-Control": "no-store"},
     )
 
 

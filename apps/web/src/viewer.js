@@ -27,6 +27,7 @@ const sceneAudioEl       = document.getElementById("scene-audio");
 const cursorReticleEl    = document.getElementById("cursor-reticle");
 const boxesBtn       = document.getElementById("btn-boxes");
 const musicBtn       = document.getElementById("btn-music");
+const slideshowBtn   = document.getElementById("btn-slideshow");
 const fullscreenBtn  = document.getElementById("btn-fullscreen");
 const renderModeBtn  = document.getElementById("btn-render-mode");
 
@@ -373,18 +374,18 @@ async function mapWithConcurrency(items, limit, fn) {
 const POINT_CLOUD_MAX_POINTS = 12_000;
 // Base world-space point size at "1 unit from camera" — see uPixelScale below,
 // which turns this into an actual on-screen pixel size every frame.
-const POINT_SIZE = 5;
+const POINT_SIZE = 1;
 // Distance (world units) from the camera within which a point is fully
 // visible/at max size, and beyond which it fades all the way to invisible.
 // Tunable — these are a first pass; adjust to taste once you can see it live.
 const POINT_FADE_NEAR = 1;
-const POINT_FADE_FAR  = 140;
+const POINT_FADE_FAR  = 100;
 // On-screen size clamp in pixels: MAX makes close-up points read as "quite
 // large" instead of a fine mist; MIN keeps far-but-still-visible points from
 // shimmering at sub-pixel size. Keep MAX modest — each point is ONE flat,
 // unblended splat colour, so blowing it up too far turns a soft-looking
 // cloud into a mosaic of harsh, oversized, single-colour tiles.
-const POINT_MAX_PIXEL_SIZE = 80;
+const POINT_MAX_PIXEL_SIZE = 25;
 const POINT_MIN_PIXEL_SIZE = 0;
 // Proxies are now tiny pre-decimated blobs (~180 KB) served by
 // /api/scene-proxy, not the full ~64 MB PLY — so we can fetch many at once.
@@ -437,26 +438,13 @@ const POINT_FRAGMENT_SHADER = /* glsl */ `
     return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
   }
 
-  // Custom ShaderMaterial gets none of THREE's automatic linear->sRGB output
-  // conversion that built-in materials apply — vColor arrives here already
-  // decoded to linear (see srgbToLinear() on the JS side), so this is the
-  // matching re-encode for display. Without it, colour comes out too dark in
-  // the midtones; getting the decode/encode direction backwards instead
-  // (encoding twice) is what produces oversaturated, blown-out colour.
-  vec3 linearToSRGB(vec3 c) {
-    vec3 lo = c * 12.92;
-    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
-    return mix(lo, hi, step(vec3(0.0031308), c));
-  }
-
   void main() {
-    // Soft round sprite instead of a hard-edged square — feathered edge
-    // reads as a natural blob and blends into neighbouring points instead
-    // of tiling into an obvious flat-coloured mosaic.
-    float d = length(gl_PointCoord - 0.5);
-    float shape = 1.0 - smoothstep(0.3, 0.5, d);
-    if (shape <= 0.0 || vVisible * shape < ditherThreshold(gl_FragCoord.xy)) discard;
-    gl_FragColor = vec4(linearToSRGB(vColor), 1.0);
+    // Sharp square points: gl.POINTS render as squares, and we keep the whole
+    // quad (no circular mask) so each point is a crisp, hard-edged pixel block.
+    // Colour is written straight through — the proxy already carries display
+    // RGB (see proxy.py), so no colour-space conversion here.
+    if (vVisible < ditherThreshold(gl_FragCoord.xy)) discard;
+    gl_FragColor = vec4(vColor, 1.0);
   }
 `;
 
@@ -495,19 +483,11 @@ async function fetchProxyPoints(sceneId) {
   const positions = new Float32Array(buf, 8, count * 3);        // 8 is 4-byte aligned
   const colU8     = new Uint8Array(buf, 8 + count * 12, count * 3);
   const colors    = new Float32Array(count * 3);
-  // These bytes are ordinary sRGB-encoded colour (same convention as any
-  // photo pixel), but our point-cloud shader is a custom ShaderMaterial —
-  // unlike built-in materials, THREE doesn't auto-convert vertex colours for
-  // those, and it expects them in linear space. Decode sRGB->linear here so
-  // the shader's own linear->sRGB encode (see POINT_FRAGMENT_SHADER) round-
-  // trips back to the original colour instead of gamma-compounding it into
-  // an oversaturated mess.
-  for (let i = 0; i < colors.length; i++) colors[i] = srgbToLinear(colU8[i] / 255);
+  // The proxy already carries display-ready RGB (see proxy.py's SH->RGB), so
+  // just normalise 0-255 -> 0-1 and hand it straight to the shader, which
+  // writes it through unchanged.
+  for (let i = 0; i < colors.length; i++) colors[i] = colU8[i] / 255;
   return { positions, colors, count };
-}
-
-function srgbToLinear(c) {
-  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
 // Measure a scene's on-plane footprint from the proxy points (5th–95th
@@ -1137,16 +1117,26 @@ function stopDwell() {
   timerArcEl.style.strokeDashoffset = TIMER_C;
 }
 
-// ── World auto-advance ────────────────────────────────────────────────────
-// After WORLD_DWELL_MS of no user selection, the camera flies to the next
-// memory in the world and the cycle continues indefinitely.
+// ── World auto-advance (slideshow) ────────────────────────────────────────
+// When the slideshow is on, after WORLD_DWELL_MS of no user selection the
+// camera flies to the next memory and keeps cycling. Off by default; toggled
+// by the bottom-right slideshow button.
 
 let _worldDwellTimer = null;
 let _worldAutoIndex  = 0;
+let slideshowEnabled = false;
 
 function startWorldDwell() {
   clearTimeout(_worldDwellTimer);
+  _worldDwellTimer = null;
+  if (!slideshowEnabled) return; // slideshow off — never auto-advance
   _worldDwellTimer = setTimeout(_worldAdvance, WORLD_DWELL_MS);
+}
+
+function setSlideshowEnabled(enabled) {
+  slideshowEnabled = enabled;
+  if (enabled) startWorldDwell();
+  else stopWorldDwell();
 }
 
 function stopWorldDwell() {
@@ -1977,35 +1967,77 @@ document.addEventListener("keydown", e => {
 });
 
 // ── Debug / utility control buttons (bottom-right) ────────────────────────
+// Toggle states are remembered per browser in localStorage. Fullscreen is the
+// exception — browsers only allow it from a fresh user gesture, so it can't be
+// restored automatically on load.
+
+const PANEL_PREFS_KEY = "memo-viewer-panel";
+
+function loadPanelPrefs() {
+  try { return JSON.parse(localStorage.getItem(PANEL_PREFS_KEY) || "{}") || {}; }
+  catch { return {}; }
+}
+function savePanelPref(key, value) {
+  const prefs = loadPanelPrefs();
+  prefs[key] = value;
+  try { localStorage.setItem(PANEL_PREFS_KEY, JSON.stringify(prefs)); } catch {}
+}
+function setBtnState(btn, on) {
+  if (!btn) return;
+  btn.classList.toggle("active", on);
+  btn.setAttribute("aria-pressed", String(on));
+}
 
 boxesBtn?.addEventListener("click", () => {
   const next = !showBoundaryBoxes;
   setBoundaryBoxesVisible(next);
-  boxesBtn.classList.toggle("active", next);
-  boxesBtn.setAttribute("aria-pressed", String(next));
+  setBtnState(boxesBtn, next);
+  savePanelPref("boxes", next);
 });
 
 musicBtn?.addEventListener("click", () => {
-  const enabling = audioMuted; // currently muted → this click turns it on
-  setMusicEnabled(enabling);
-  musicBtn.classList.toggle("active", enabling);
-  musicBtn.setAttribute("aria-pressed", String(enabling));
+  const next = audioMuted; // currently muted → this click turns it on
+  setMusicEnabled(next);
+  setBtnState(musicBtn, next);
+  savePanelPref("music", next);
+});
+
+slideshowBtn?.addEventListener("click", () => {
+  const next = !slideshowEnabled;
+  setSlideshowEnabled(next);
+  setBtnState(slideshowBtn, next);
+  savePanelPref("slideshow", next);
 });
 
 fullscreenBtn?.addEventListener("click", () => toggleFullscreen());
-document.addEventListener("fullscreenchange", () => {
-  const fs = isFullscreen();
-  fullscreenBtn?.classList.toggle("active", fs);
-  fullscreenBtn?.setAttribute("aria-pressed", String(fs));
-});
+document.addEventListener("fullscreenchange", () => setBtnState(fullscreenBtn, isFullscreen()));
 
 renderModeBtn?.addEventListener("click", () => {
   const next = !forcePointCloudOnly;
   setPointCloudOnly(next);
   renderModeBtn.textContent = next ? "POINTS" : "SPLAT";
-  renderModeBtn.classList.toggle("active", next);
-  renderModeBtn.setAttribute("aria-pressed", String(next));
+  setBtnState(renderModeBtn, next);
+  savePanelPref("pointCloudOnly", next);
 });
+
+// Restore saved panel state (defaults: boxes off, music on, slideshow off,
+// splats on). `music` defaults on, so only "explicitly saved false" mutes.
+(function applyPanelPrefs() {
+  const p = loadPanelPrefs();
+  const boxes          = p.boxes === true;
+  const music          = p.music !== false;
+  const slideshow      = p.slideshow === true;
+  const pointCloudOnly = p.pointCloudOnly === true;
+
+  setBoundaryBoxesVisible(boxes);   setBtnState(boxesBtn, boxes);
+  setMusicEnabled(music);           setBtnState(musicBtn, music);
+  setSlideshowEnabled(slideshow);   setBtnState(slideshowBtn, slideshow);
+  setPointCloudOnly(pointCloudOnly);
+  if (renderModeBtn) {
+    renderModeBtn.textContent = pointCloudOnly ? "POINTS" : "SPLAT";
+    setBtnState(renderModeBtn, pointCloudOnly);
+  }
+})();
 
 // ── Keyboard fly navigation ───────────────────────────────────────────────
 
